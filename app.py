@@ -38,6 +38,8 @@ def reset_application():
         del st.session_state["retriever"]
     if "vector_db" in st.session_state:
         del st.session_state["vector_db"]
+    if "processed_files" in st.session_state:
+        del st.session_state["processed_files"]
 
 # --- Sidebar ---
 with st.sidebar:
@@ -50,22 +52,72 @@ with st.sidebar:
     
     st.divider()
     
-    # 2. File Uploader (Linked to reset callback)
+    # 2. File Uploader (Modified for single file processing)
     uploaded_files = st.file_uploader(
-        "Upload PDF Documents", 
+        "Upload PDF Documents (one at a time)", 
         type=["pdf"], 
         accept_multiple_files=True,
-        on_change=reset_application # <--- The Critical Fix
+        help="Upload PDFs one by one. Each file will be processed and added to the knowledge base."
     )
     
     st.divider()
     
-    # 3. Clear Chat Button
-    if st.button("Clear Chat History", use_container_width=True):
-        st.session_state["messages"] = []
-        st.rerun()
+    # 3. Control Buttons
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("Clear Chat", use_container_width=True):
+            st.session_state["messages"] = []
+            st.rerun()
+    
+    with col2:
+        if st.button("Reset All", use_container_width=True):
+            reset_application()
+            st.rerun()
 
 # --- Backend Logic ---
+
+def process_single_pdf(uploaded_file, existing_vectorstore=None):
+    """
+    Processes a single PDF file and adds it to the vector store.
+    """
+    # Create temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+        tmp_file.write(uploaded_file.read())
+        temp_file_path = tmp_file.name
+
+    try:
+        # Load document
+        loader = PyMuPDFLoader(temp_file_path)
+        docs = loader.load()
+        
+        # Add filename metadata to each document
+        for doc in docs:
+            doc.metadata["source_file"] = uploaded_file.name
+        
+    finally:
+        os.remove(temp_file_path)
+    
+    # Split documents
+    splitter = RecursiveCharacterTextSplitter(chunk_size=3000, chunk_overlap=300)
+    doc_chunks = splitter.split_documents(docs)
+
+    # Create or update vector store
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    
+    if existing_vectorstore is None:
+        # Create new vector store
+        vectorstore = Chroma.from_documents(
+            documents=doc_chunks,
+            collection_name="rag_collection",
+            embedding=embeddings,
+        )
+    else:
+        # Add to existing vector store
+        existing_vectorstore.add_documents(doc_chunks)
+        vectorstore = existing_vectorstore
+    
+    return vectorstore
 
 def create_vector_db(uploaded_files):
     """
@@ -85,6 +137,9 @@ def create_vector_db(uploaded_files):
         try:
             loader = PyMuPDFLoader(temp_file_path)
             docs = loader.load()
+            # Add filename metadata
+            for doc in docs:
+                doc.metadata["source_file"] = uploaded_file.name
             all_docs.extend(docs)
         finally:
             os.remove(temp_file_path)
@@ -149,17 +204,44 @@ if not uploaded_files:
     st.info("👈 Please upload PDF documents in the sidebar to start.")
     st.stop()
 
-# 2. Process Documents (Only if not already processed)
+# 2. Process Documents (Handle incremental uploads)
+# Initialize processed files tracker
+if "processed_files" not in st.session_state:
+    st.session_state["processed_files"] = set()
+
+# Check for new files
+current_files = {f.name for f in uploaded_files} if uploaded_files else set()
+new_files = current_files - st.session_state["processed_files"]
+
+if new_files:
+    # Process new files one by one
+    for uploaded_file in uploaded_files:
+        if uploaded_file.name in new_files:
+            with st.spinner(f"Processing {uploaded_file.name}..."):
+                try:
+                    existing_vectorstore = st.session_state.get("vector_db", None)
+                    vector_db = process_single_pdf(uploaded_file, existing_vectorstore)
+                    
+                    st.session_state["vector_db"] = vector_db
+                    st.session_state["retriever"] = vector_db.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+                    st.session_state["processed_files"].add(uploaded_file.name)
+                    
+                    st.toast(f"✅ {uploaded_file.name} processed successfully!", icon="📄")
+                except Exception as e:
+                    st.error(f"Error processing {uploaded_file.name}: {e}")
+                    continue
+
+# Show processed files count
+if st.session_state["processed_files"]:
+    st.sidebar.success(f"📚 {len(st.session_state['processed_files'])} files processed")
+    with st.sidebar.expander("View processed files"):
+        for filename in sorted(st.session_state["processed_files"]):
+            st.write(f"• {filename}")
+
+# Check if we have a vector store
 if "vector_db" not in st.session_state:
-    with st.spinner("Processing documents..."):
-        try:
-            vector_db = create_vector_db(uploaded_files)
-            st.session_state["vector_db"] = vector_db
-            st.session_state["retriever"] = vector_db.as_retriever(search_type="similarity", search_kwargs={"k": 3})
-            st.toast("Documents processed successfully!", icon="✅")
-        except Exception as e:
-            st.error(f"Error processing documents: {e}")
-            st.stop()
+    st.info("👈 Please upload PDF documents to start asking questions.")
+    st.stop()
 
 # 3. Chat Interface
 if "messages" not in st.session_state:
