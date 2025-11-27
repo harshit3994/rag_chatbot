@@ -21,23 +21,68 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
 # --- Page Config ---
-st.set_page_config(page_title="RAG Chatbot", page_icon="🤖")
+st.set_page_config(
+    page_title="RAG Chatbot",
+    page_icon="🤖",
+    layout="wide"
+)
 
-# --- UI Setup ---
-st.title("RAG QA Chatbot 🤖")
-st.markdown("Upload **one or more** PDF documents and ask questions based on their content.")
+# --- Small CSS Touches ---
+st.markdown(
+    """
+    <style>
+        .main-title {
+            font-size: 2.2rem;
+            font-weight: 700;
+            margin-bottom: 0.2rem;
+        }
+        .subtitle {
+            color: #6c757d;
+            font-size: 0.95rem;
+            margin-bottom: 1.5rem;
+        }
+        .file-pill {
+            padding: 0.15rem 0.6rem;
+            border-radius: 999px;
+            background-color: #f0f2f6;
+            display: inline-block;
+            margin: 0.15rem 0.3rem 0.15rem 0;
+            font-size: 0.8rem;
+        }
+        .footer-note {
+            font-size: 0.8rem;
+            color: #8c8c8c;
+            margin-top: 1rem;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# --- Header ---
+st.markdown('<div class="main-title">RAG QA Chatbot 🤖</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="subtitle">Upload one or more PDF documents and ask questions based on their content.</div>',
+    unsafe_allow_html=True,
+)
 
 # --- Sidebar for Settings ---
 with st.sidebar:
-    st.header("Configuration")
+    st.header("⚙️ Configuration")
 
-    # 1. API Key Input
-    user_api_key = st.text_input("Enter OpenAI API Key", type="password")
+    user_api_key = st.text_input("OpenAI API Key", type="password", help="Your OpenAI API key will be used only in this session.")
 
     st.divider()
 
-    # 2. File Uploader (Multiple Files Allowed)
-    uploaded_files = st.file_uploader("Upload your PDFs", type=["pdf"], accept_multiple_files=True)
+    uploaded_files = st.file_uploader(
+        "Upload PDF files",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help="You can upload multiple PDFs. The bot will answer using all of them."
+    )
+
+    st.markdown("---")
+    st.caption("Tip: Larger PDFs may take a bit longer to process on the first run.")
 
 
 # ---------- Helper Functions ----------
@@ -68,12 +113,10 @@ def process_documents(uploaded_files, api_key: str):
             temp_file_path = tmp_file.name
 
         try:
-            # Load the document
             loader = PyMuPDFLoader(temp_file_path)
             docs = loader.load()
             all_docs.extend(docs)  # Collect pages from all files
         finally:
-            # Clean up the temp file
             os.remove(temp_file_path)
 
     # 2. Split documents
@@ -90,7 +133,7 @@ def process_documents(uploaded_files, api_key: str):
         documents=doc_chunks,
         collection_name="rag_collection",
         embedding=embeddings,
-        # For persistence across restarts, you could add:
+        # For persistence across restarts, add:
         # persist_directory="chroma_db"
     )
 
@@ -143,17 +186,16 @@ Answer:
 # 1. Resolve API key (from input or environment)
 if user_api_key:
     api_key = user_api_key
-    # Optional: also set env var so any underlying libs see it
-    os.environ["OPENAI_API_KEY"] = user_api_key
+    os.environ["OPENAI_API_KEY"] = user_api_key  # optional but convenient
 elif os.getenv("OPENAI_API_KEY"):
     api_key = os.environ["OPENAI_API_KEY"]
 else:
-    st.info("Please enter your OpenAI API key in the sidebar to proceed.")
+    st.info("🔑 Please enter your OpenAI API key in the sidebar to proceed.")
     st.stop()
 
 # 2. Handle File Processing
 if not uploaded_files:
-    st.info("Please upload PDF documents to start chatting.")
+    st.info("📄 Please upload one or more PDF documents to start chatting.")
     st.stop()
 
 files_sig = get_files_signature(uploaded_files)
@@ -178,46 +220,79 @@ if need_rebuild:
                 }
             ]
 
-            st.success("Documents processed successfully!")
+            st.success("✅ Documents processed successfully!")
         except Exception as e:
             st.error(f"Error processing documents: {e}")
             st.stop()
 else:
     retriever = st.session_state["retriever"]
 
-# 3. Initialize Chat History if not already done
-if "messages" not in st.session_state:
-    st.session_state["messages"] = [
-        {
-            "role": "assistant",
-            "content": "Hi! I've read your documents. Ask me anything about them.",
-        }
-    ]
+# 3. Layout: Chat (left) and Info (right)
+left_col, right_col = st.columns([2.2, 1])
 
-# 4. Display Chat Messages
-for msg in st.session_state["messages"]:
-    st.chat_message(msg["role"]).write(msg["content"])
+# ---------- Right Column: Document Info & Help ----------
+with right_col:
+    st.subheader("📚 Documents loaded")
 
-# 5. Handle User Input
-user_input = st.chat_input("Ask a question...")
+    if uploaded_files:
+        st.write(f"**{len(uploaded_files)} PDF(s)** currently in context:")
+        for f in uploaded_files:
+            st.markdown(f'<span class="file-pill">{f.name}</span>', unsafe_allow_html=True)
+    else:
+        st.write("_No files uploaded yet._")
 
-if user_input:
-    # Display user message
-    st.session_state["messages"].append({"role": "user", "content": user_input})
-    st.chat_message("user").write(user_input)
+    st.markdown("### 💡 How to use")
+    st.markdown(
+        """
+        1. Upload one or more PDF files from the sidebar.  
+        2. Wait for processing to complete.  
+        3. Ask questions like:
+           - *\"Summarize chapter 2\"*  
+           - *\"What are the key conclusions?\"*  
+           - *\"What is the refund policy mentioned?\"*  
+        """
+    )
 
-    # Generate Response
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            try:
-                retriever = st.session_state["retriever"]
-                chain = get_rag_chain(retriever, api_key)
+    st.markdown(
+        '<div class="footer-note">The bot answers strictly from your PDFs and says "I don\'t know" if it can’t find the answer.</div>',
+        unsafe_allow_html=True,
+    )
 
-                response = chain.invoke(user_input)
+# ---------- Left Column: Chat Interface ----------
+with left_col:
+    # 4. Initialize Chat History if not already done
+    if "messages" not in st.session_state:
+        st.session_state["messages"] = [
+            {
+                "role": "assistant",
+                "content": "Hi! I've read your documents. Ask me anything about them.",
+            }
+        ]
 
-                st.write(response)
-                st.session_state["messages"].append(
-                    {"role": "assistant", "content": response}
-                )
-            except Exception as e:
-                st.error(f"An error occurred: {e}")
+    # 5. Display Chat Messages
+    for msg in st.session_state["messages"]:
+        st.chat_message(msg["role"]).write(msg["content"])
+
+    # 6. Handle User Input
+    user_input = st.chat_input("Ask a question about your documents...")
+
+    if user_input:
+        # Display user message
+        st.session_state["messages"].append({"role": "user", "content": user_input})
+        st.chat_message("user").write(user_input)
+
+        # Generate Response
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                try:
+                    retriever = st.session_state["retriever"]
+                    chain = get_rag_chain(retriever, api_key)
+
+                    response = chain.invoke(user_input)
+
+                    st.write(response)
+                    st.session_state["messages"].append(
+                        {"role": "assistant", "content": response}
+                    )
+                except Exception as e:
+                    st.error(f"An error occurred: {e}")
