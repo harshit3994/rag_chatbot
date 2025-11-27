@@ -3,13 +3,14 @@ try:
     import sys
     sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
 except ImportError:
-    # If pysqlite3 is not installed (e.g., running locally), pass.
     pass
 # -----------------------------------------
 
 import streamlit as st
 import os
 import tempfile
+import time
+
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
@@ -19,138 +20,182 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
 # --- Page Config ---
-st.set_page_config(page_title="RAG Chatbot", page_icon="🤖")
+st.set_page_config(
+    page_title="DocuChat AI", 
+    page_icon="📚", 
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# --- UI Setup ---
-st.title("RAG QA Chatbot 🤖")
-st.markdown("Upload **one or more** PDF documents and ask questions based on their content.")
+# --- Custom CSS for clean look ---
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        color: #4A90E2;
+        text-align: center;
+        font-weight: 700;
+        margin-bottom: 1rem;
+    }
+    .sub-text {
+        text-align: center;
+        color: #666;
+        margin-bottom: 2rem;
+    }
+    .stChatMessage {
+        border-radius: 10px;
+        padding: 10px;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# --- Sidebar for Settings ---
+# --- State Management Helper ---
+def reset_conversation():
+    """Resets the chat history and vector store when new files are uploaded."""
+    st.session_state["messages"] = []
+    st.session_state["vector_db"] = None
+    if "retriever" in st.session_state:
+        del st.session_state["retriever"]
+
+# --- Sidebar ---
 with st.sidebar:
-    st.header("Configuration")
+    st.image("https://img.icons8.com/clouds/100/000000/book.png", width=80)
+    st.title("Settings")
     
-    # 1. API Key Input
-    user_api_key = st.text_input("Enter OpenAI API Key", type="password")
-    
+    # 1. API Key
+    api_key = st.text_input("OpenAI API Key", type="password", placeholder="sk-...")
+    if api_key:
+        os.environ["OPENAI_API_KEY"] = api_key
+        st.success("API Key accepted", icon="✅")
+    else:
+        st.warning("Please enter API Key", icon="⚠️")
+
+    st.divider()
+
+    # 2. File Uploader with on_change callback
+    st.subheader("Document Source")
+    uploaded_files = st.file_uploader(
+        "Upload PDFs", 
+        type=["pdf"], 
+        accept_multiple_files=True,
+        on_change=reset_conversation # Crucial for UX: Reset if files change
+    )
+
     st.divider()
     
-    # 2. File Uploader (Multiple Files Allowed)
-    uploaded_files = st.file_uploader("Upload your PDFs", type=["pdf"], accept_multiple_files=True)
+    # 3. Actions
+    if st.button("Clear Chat History", use_container_width=True):
+        st.session_state["messages"] = []
+        st.rerun()
 
-# --- Backend Logic ---
+# --- Backend Logic (Cached) ---
 
-def process_documents(uploaded_files):
+@st.cache_resource(show_spinner=False)
+def create_vector_db(uploaded_files):
     """
-    Handles saving, loading, splitting, and vector storage for MULTIPLE files.
+    Processes PDFs and returns a Chroma vector store. 
+    Cached to prevent re-processing on every interaction.
     """
     all_docs = []
     
-    # 1. Loop through each uploaded file
-    for uploaded_file in uploaded_files:
-        # Create a temp file for each upload so PyMuPDF can read it
+    progress_text = "Operation in progress. Please wait."
+    my_bar = st.progress(0, text=progress_text)
+
+    total_files = len(uploaded_files)
+    
+    for idx, uploaded_file in enumerate(uploaded_files):
+        # Update progress bar
+        my_bar.progress((idx + 1) / total_files, text=f"Processing file {idx+1} of {total_files}...")
+        
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
             tmp_file.write(uploaded_file.read())
             temp_file_path = tmp_file.name
 
         try:
-            # Load the document
             loader = PyMuPDFLoader(temp_file_path)
             docs = loader.load()
-            all_docs.extend(docs) # Collect pages from all files
+            all_docs.extend(docs)
         finally:
-            # Clean up the temp file
             os.remove(temp_file_path)
 
-    # 2. Split documents
+    my_bar.progress(1.0, text="Splitting documents...")
+    
+    # Split
     splitter = RecursiveCharacterTextSplitter(chunk_size=3000, chunk_overlap=300)
     doc_chunks = splitter.split_documents(all_docs)
 
-    # 3. Create Embeddings & Vector Store
-    # We use an in-memory vector store for the session
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    my_bar.progress(1.0, text="Creating embeddings...")
     
+    # Vector Store
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
     vectorstore = Chroma.from_documents(
         documents=doc_chunks,
         collection_name="rag_collection",
         embedding=embeddings,
     )
     
-    return vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+    my_bar.empty() # Remove progress bar
+    return vectorstore
 
 def get_rag_chain(retriever):
-    """
-    Creates the Retrieval-Augmented Generation chain.
-    """
-    rag_prompt = """You are an assistant who is an expert in question-answering tasks.
-              Answer the following question using only the following pieces of retrieved context.
-              If the answer is not in the context, do not make up answers, just say that you don't know.
-              Keep the answer detailed and well formatted based on the information from the context.
-              Please ensure the language and grammar would be correct.
-
-              Question:
-              {question}
-
-              Context:
-              {context}
-
-              Answer:
-              """
+    rag_prompt = """You are a helpful assistant. Answer the question using only the context below.
+    If the answer is not in the context, say you don't know.
     
-    rag_prompt_template = ChatPromptTemplate.from_template(rag_prompt)
+    Context: {context}
+    
+    Question: {question}
+    """
+    prompt = ChatPromptTemplate.from_template(rag_prompt)
     llm = ChatOpenAI(model_name="gpt-4o-mini", temperature=0)
     
-    def format_docs(docs):
-        return "\n\n".join(doc.page_content for doc in docs)
-
-    rag_chain = (
-        {"context": (retriever | format_docs), "question": RunnablePassthrough()}
-        | rag_prompt_template
+    chain = (
+        {"context": (retriever | (lambda docs: "\n\n".join(d.page_content for d in docs))), 
+         "question": RunnablePassthrough()}
+        | prompt
         | llm
         | StrOutputParser()
     )
-    
-    return rag_chain
+    return chain
 
-# --- Main App Execution ---
+# --- Main Interface ---
 
-# 1. Check API Key
-if user_api_key:
-    os.environ["OPENAI_API_KEY"] = user_api_key
-elif "OPENAI_API_KEY" not in os.environ:
-    st.info("Please enter your OpenAI API key in the sidebar to proceed.")
+st.markdown('<div class="main-header">DocuChat AI 📚</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-text">Chat with your PDF documents seamlessly.</div>', unsafe_allow_html=True)
+
+# Checks
+if not api_key:
+    st.info("👈 Please enter your OpenAI API key in the sidebar to continue.")
     st.stop()
 
-# 2. Handle File Processing
-if uploaded_files:
-    # Use session state to avoid re-processing on every message
-    if "vectors_processed" not in st.session_state:
-        with st.spinner(f"Processing {len(uploaded_files)} document(s)..."):
-            try:
-                retriever = process_documents(uploaded_files)
-                st.session_state["retriever"] = retriever
-                st.session_state["vectors_processed"] = True
-                st.success("Documents processed successfully!")
-            except Exception as e:
-                st.error(f"Error processing documents: {e}")
-                st.stop()
-else:
-    st.info("Please upload PDF documents to start chatting.")
+if not uploaded_files:
+    st.info("👈 Please upload a PDF document in the sidebar to start.")
     st.stop()
 
-# 3. Initialize Chat History
+# Initialize Chat
 if "messages" not in st.session_state:
-    st.session_state["messages"] = []
-    st.session_state["messages"].append({"role": "assistant", "content": "Hi! I've read your documents. Ask me anything about them."})
+    st.session_state["messages"] = [{"role": "assistant", "content": "Hello! I'm ready to answer questions about your documents."}]
 
-# 4. Display Chat Messages
-for msg in st.session_state["messages"]:
-    st.chat_message(msg["role"]).write(msg["content"])
+# Process Documents (Only runs if not cached or files changed)
+if "vector_db" not in st.session_state or st.session_state["vector_db"] is None:
+    with st.spinner("Analyzing documents..."):
+        try:
+            vector_db = create_vector_db(uploaded_files)
+            st.session_state["vector_db"] = vector_db
+            st.session_state["retriever"] = vector_db.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+            st.toast("Documents processed successfully!", icon="🎉")
+        except Exception as e:
+            st.error(f"Error processing documents: {e}")
+            st.stop()
 
-# 5. Handle User Input
-user_input = st.chat_input("Ask a question...")
+# Display Chat History
+chat_container = st.container()
+with chat_container:
+    for msg in st.session_state["messages"]:
+        st.chat_message(msg["role"]).write(msg["content"])
 
-if user_input:
-    # Display user message
+# User Input
+if user_input := st.chat_input("Ask a question about your PDF..."):
+    # Add user message
     st.session_state["messages"].append({"role": "user", "content": user_input})
     st.chat_message("user").write(user_input)
 
@@ -160,7 +205,6 @@ if user_input:
             try:
                 retriever = st.session_state["retriever"]
                 chain = get_rag_chain(retriever)
-                
                 response = chain.invoke(user_input)
                 
                 st.write(response)
